@@ -41,10 +41,12 @@ def _empty_session() -> dict[str, Any]:
             "cc": [],
             "bcc": [],
             "attachments": [],
-            "signature_enabled": False,
-            "signature_mode": "off",
+            "signature_enabled": True,
+            "signature_mode": "body",
             "signature_html": "",
-            "signature_image": "",
+            # "default" = the bundled company logo (assets/default_logo.png).
+            "signature_image": "default",
+            "template_version": 0,
         },
         "campaign": {
             "sent": [],

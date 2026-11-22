@@ -33,7 +33,7 @@ a = Analysis(
     ["mail_sender_gui.py"],
     pathex=[],
     binaries=ctk_binaries + tkhtml_binaries,
-    datas=ctk_datas + tkhtml_datas,
+    datas=ctk_datas + tkhtml_datas + [("assets/default_logo.png", "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

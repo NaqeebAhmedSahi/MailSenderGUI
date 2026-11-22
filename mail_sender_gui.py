@@ -17,8 +17,10 @@ try:
 except ImportError:  # pragma: no cover
     Image = ImageTk = None
 
-from html_editor import HtmlEditor, html_to_plain
-from session_store import SessionStore
+from html_editor import HtmlEditor, SignatureEditor, html_to_plain
+import shutil
+
+from session_store import SessionStore, get_data_dir
 from mail_core import (
     DEFAULT_SMTP_HOST,
     DEFAULT_SMTP_PORT,
@@ -36,6 +38,83 @@ from mail_core import (
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+# Signature = the company logo only. The closing text lives in the email body.
+DEFAULT_SIGNATURE_HTML = "<div>{{LOGO}}</div>"
+
+# Closing text for the email body; {{SIGNATURE}} is where the logo goes
+# (matches templates/email_body_template.html).
+DEFAULT_BODY_CLOSING_HTML = (
+    '<div style="color:#1f4e79;">With kind regards,<br>'
+    "International Sales Manager Pakistan<br>"
+    "<strong>Areesha Hassan</strong></div>"
+    "<div>{{SIGNATURE}}</div>"
+    '<div style="color:#1f4e79;">'
+    'Mobile/WhatsApp: <a href="tel:+923083731070" style="color:#1155cc;">+92 308 3731070</a><br>'
+    'UK Contact: <a href="tel:+447791126222" style="color:#1155cc;">+44 7791 126222</a><br>'
+    '<a href="https://www.surgicalsense.co.uk" style="color:#1155cc;">www.surgicalsense.co.uk</a>'
+    "</div>"
+)
+DEFAULT_BODY_HTML = "<div>Dear Sir/Madam,<br><br><br></div>" + DEFAULT_BODY_CLOSING_HTML
+# Earlier versions kept this text inside the signature; such saved
+# signatures are moved into the body on load.
+_CLOSING_KEY_TEXT = "International Sales Manager Pakistan"
+# Bump when the company template changes: older saved setups are upgraded.
+TEMPLATE_VERSION = 2
+DEFAULT_LOGO_KEY = "default"
+# Display size of the signature logo (matches the company signature layout).
+LOGO_MAX_WIDTH = 125
+LOGO_MAX_HEIGHT = 40
+
+
+def trimmed_logo(path: str) -> str:
+    """Return a copy of the logo with empty white/transparent borders removed.
+
+    The copy lives in the data folder; the original path is returned when
+    nothing needs trimming or the image can't be read.
+    """
+    if not path or Image is None or Path(path).name == "default_logo.png":
+        return path  # the bundled logo is already trimmed
+    try:
+        from PIL import ImageChops
+
+        with Image.open(path) as img:
+            rgba = img.convert("RGBA")
+        white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        flat = Image.alpha_composite(white, rgba).convert("RGB")
+        diff = ImageChops.difference(flat, Image.new("RGB", flat.size, (255, 255, 255)))
+        box = diff.convert("L").point(lambda v: 255 if v > 25 else 0).getbbox()
+        if not box:
+            return path
+        pad = 2
+        left, top, right, bottom = box
+        box = (max(0, left - pad), max(0, top - pad),
+               min(flat.width, right + pad), min(flat.height, bottom + pad))
+        if box == (0, 0, flat.width, flat.height):
+            return path
+        target = get_data_dir() / f"logo_{Path(path).stem}.png"
+        rgba.crop(box).save(target)
+        return str(target)
+    except Exception:
+        return path
+
+
+def _resource_path(relative: str) -> Path:
+    """Path to a bundled file, both from source and inside the PyInstaller exe."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
+
+def default_logo_path() -> str:
+    """Copy the bundled logo to the user's data folder (stable path) and return it."""
+    target = get_data_dir() / "default_logo.png"
+    source = _resource_path("assets/default_logo.png")
+    try:
+        if source.exists() and (not target.exists() or target.stat().st_size != source.stat().st_size):
+            shutil.copyfile(source, target)
+    except OSError:
+        return str(source) if source.exists() else ""
+    return str(target) if target.exists() else ""
 
 COLORS = {
     "bg": "#0B0F19",
@@ -261,8 +340,9 @@ class EmailTagInput(ctk.CTkFrame):
             command=self._add_from_entry,
         ).pack(side="left")
 
-        self.chips = ctk.CTkFrame(self, fg_color="transparent")
-        self.chips.pack(fill="x", pady=(8, 0))
+        # Empty CTkFrames default to 200px tall, so the chip area is only
+        # packed while it holds addresses (see _render_chips).
+        self.chips = ctk.CTkFrame(self, fg_color="transparent", height=1)
 
         self.hint = ctk.CTkLabel(
             self,
@@ -327,9 +407,11 @@ class EmailTagInput(ctk.CTkFrame):
         self._chip_widgets.clear()
 
         if not self._emails:
+            self.chips.pack_forget()
             self.hint.configure(text="Press Enter to add. Unlimited addresses.")
             return
 
+        self.chips.pack(fill="x", pady=(8, 0), before=self.hint)
         self.hint.configure(text=f"{len(self._emails)} address(es)")
 
         row = None
@@ -573,11 +655,11 @@ class MailSenderApp(ctk.CTk):
             self.preview_box,
             self.log_box,
             self.body_editor.source_box,
-            self.signature_box,
         ]
         for textbox in textboxes:
             enable_textbox_scroll(textbox)
         enable_tktext_scroll(self.body_editor.visual_editor)
+        enable_tktext_scroll(self.signature_editor.text)
         self._scroll_cleanup = enable_scrollable_frame(self.main_scroll, textboxes=textboxes)
 
     def _on_close(self) -> None:
@@ -857,6 +939,7 @@ class MailSenderApp(ctk.CTk):
         self.body_editor.signature_renderer = self._render_signature_block
         self.body_editor.preview_builder = self._build_preview_html
         self.body_editor.pack(fill="x")
+        self.body_editor.set_html(DEFAULT_BODY_HTML)
 
     def _build_attachments_section(self, parent) -> None:
         ctk.CTkLabel(
@@ -944,31 +1027,20 @@ class MailSenderApp(ctk.CTk):
                 radiobutton_height=18,
             ).pack(side="right", padx=(12, 0))
 
-        self.signature_box = ctk.CTkTextbox(
-            parent,
-            height=110,
-            corner_radius=12,
-            fg_color=COLORS["surface_alt"],
-            border_color=COLORS["border"],
-            border_width=1,
-            text_color=COLORS["text"],
-            font=ctk.CTkFont(family="Consolas", size=12),
-            activate_scrollbars=True,
+        self.signature_editor = SignatureEditor(
+            parent, colors=COLORS, on_logo_request=self._insert_logo_at_cursor
         )
-        self.signature_box.pack(fill="x", pady=(0, 6))
-        self.signature_box.insert(
-            "1.0",
-            "Best regards,\nYour Name\nYour Title | Company\n",
-        )
-        self.signature_box.bind("<KeyRelease>", lambda _e: self._schedule_signature_refresh())
+        self.signature_editor.pack(fill="x", pady=(0, 6))
+        self.signature_editor.set_content(DEFAULT_SIGNATURE_HTML)
+        self.signature_editor.on_change = self._schedule_signature_refresh
 
         file_row = ctk.CTkFrame(parent, fg_color="transparent")
         file_row.pack(fill="x", pady=(0, 6))
 
         ctk.CTkButton(
             file_row,
-            text="Upload Signature File",
-            width=170,
+            text="Upload Logo / Signature File",
+            width=210,
             height=34,
             corner_radius=8,
             fg_color=COLORS["accent"],
@@ -979,7 +1051,7 @@ class MailSenderApp(ctk.CTk):
 
         ctk.CTkButton(
             file_row,
-            text="Clear Image",
+            text="Remove Logo",
             width=110,
             height=34,
             corner_radius=8,
@@ -991,6 +1063,20 @@ class MailSenderApp(ctk.CTk):
             command=self._clear_signature_image,
         ).pack(side="left", padx=(8, 0))
 
+        ctk.CTkButton(
+            file_row,
+            text="Use Default Template",
+            width=170,
+            height=34,
+            corner_radius=8,
+            fg_color=COLORS["surface_alt"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["accent"],
+            font=ctk.CTkFont(size=12),
+            command=self._use_default_signature,
+        ).pack(side="left", padx=(8, 0))
+
         self.signature_image_label = ctk.CTkLabel(
             parent,
             text="No signature image uploaded",
@@ -1000,20 +1086,11 @@ class MailSenderApp(ctk.CTk):
         )
         self.signature_image_label.pack(fill="x", pady=(0, 4))
 
-        # Real thumbnail of the uploaded signature image (hidden until upload).
-        self.signature_thumb = ctk.CTkLabel(
-            parent,
-            text="",
-            fg_color=COLORS["surface_alt"],
-            corner_radius=10,
-            anchor="w",
-        )
-        self._signature_thumb_anchor = self.signature_image_label
 
         ctk.CTkLabel(
             parent,
-            text="Upload an image (.png/.jpg) or a text/HTML file. \"Place in body\" drops the "
-            "signature into the editor below; drag its header to move it. Check the Preview tab.",
+            text="Select text and use B / I / U / Color / Link. Click where the logo should go, then "
+            "\"Insert Logo Here\". \"Place in body\" lets you drag the signature anywhere in the email.",
             font=ctk.CTkFont(family="Segoe UI", size=11),
             text_color=COLORS["muted"],
             anchor="w",
@@ -1148,8 +1225,13 @@ class MailSenderApp(ctk.CTk):
                 "attachments": list(self.attachment_paths),
                 "signature_enabled": self._signature_on(),
                 "signature_mode": self.signature_mode.get(),
-                "signature_html": self.signature_box.get("1.0", "end-1c"),
-                "signature_image": self.signature_image_path,
+                "template_version": TEMPLATE_VERSION,
+                "signature_html": self.signature_editor.get_html(),
+                "signature_image": (
+                    DEFAULT_LOGO_KEY
+                    if self.signature_image_path and self.signature_image_path == default_logo_path()
+                    else self.signature_image_path
+                ),
             },
         )
         self.session.save_section("message")
@@ -1184,7 +1266,7 @@ class MailSenderApp(ctk.CTk):
         self._sig_refresh_job = None
         self.body_editor.refresh_signature_block()
 
-    def _signature_image_info(self, max_width: int = 320, max_height: int = 160):
+    def _signature_image_info(self, max_width: int = LOGO_MAX_WIDTH, max_height: int = LOGO_MAX_HEIGHT):
         """Return (path, (w, h)) for the signature image scaled to fit, or ("", None)."""
         path = self.signature_image_path
         if not path or not Path(path).exists():
@@ -1209,58 +1291,67 @@ class MailSenderApp(ctk.CTk):
         except Exception:
             return None
 
-    def _refresh_signature_thumb(self) -> None:
-        if not hasattr(self, "signature_thumb"):
+    def _logo_photo(self):
+        """Tk image of the logo at the size it will have in the email."""
+        if ImageTk is None:
+            return None
+        pil = self._load_scaled_image(LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT)
+        return ImageTk.PhotoImage(pil) if pil is not None else None
+
+    def _sync_logo(self, place_if_missing: bool = False) -> None:
+        photo = self._logo_photo()
+        self._logo_photo_ref = photo
+        self.signature_editor.set_logo_photo(photo)
+        if photo is None:
+            self.signature_editor.remove_logo()
+        elif place_if_missing and not self.signature_editor.has_logo_position():
+            self.signature_editor.insert_logo("end")
+
+    def _use_default_signature(self) -> None:
+        """Logo-only signature + company closing text placed in the body."""
+        self.signature_image_path = default_logo_path()
+        self._refresh_signature_image_label()
+        self._sync_logo()
+        self.signature_editor.set_content(DEFAULT_SIGNATURE_HTML)
+        self._add_closing_to_body()
+
+    def _add_closing_to_body(self) -> None:
+        """Append the closing text (with the logo between name and phone) to the body."""
+        body = self.body_editor
+        current = strip_signature_marker(body.get_html() if not body.is_empty() else "")
+        if _CLOSING_KEY_TEXT in html_to_plain(current):
+            current_has_closing = True
+        else:
+            current_has_closing = False
+        self.signature_mode.set("body")
+        if current_has_closing:
+            # Closing already there: just make sure the logo block exists.
+            if not body.has_signature_block():
+                body.insert_signature_block("end")
+            else:
+                body.refresh_signature_block()
             return
-        pil = self._load_scaled_image(320, 120)
-        if pil is None:
-            self.signature_thumb.configure(image=None, text="")
-            self.signature_thumb.pack_forget()
-            return
-        thumb = ctk.CTkImage(light_image=pil, dark_image=pil, size=pil.size)
-        self.signature_thumb.configure(image=thumb, text="")
-        self.signature_thumb._thumb_ref = thumb
-        self.signature_thumb.pack(
-            after=self._signature_thumb_anchor, anchor="w", padx=0, pady=(0, 8), ipadx=8, ipady=8
-        )
+        html_out = f"{current}<br>{DEFAULT_BODY_CLOSING_HTML}" if current else DEFAULT_BODY_HTML
+        body.set_html(html_out)
+
+    def _insert_logo_at_cursor(self) -> None:
+        if not self.signature_image_path:
+            self._browse_signature_file(images_only=True)
+            if not self.signature_image_path:
+                return
+        if getattr(self, "_logo_photo_ref", None) is None:
+            self._sync_logo()
+        self.signature_editor.insert_logo()
 
     def _render_signature_block(self, parent) -> None:
         """Fill the draggable block in the body editor with the real signature."""
-        signature = self.signature_box.get("1.0", "end-1c").strip()
-        text = html_to_plain(signature) if "<" in signature else signature
-        bg = COLORS["surface"]
-        if text:
-            tk.Label(
-                parent,
-                text=text,
-                bg=bg,
-                fg=COLORS["text"],
-                font=("Segoe UI", 11),
-                justify=tk.LEFT,
-                anchor="w",
-                cursor="fleur",
-            ).pack(anchor="w")
-        pil = self._load_scaled_image(260, 110)
-        if pil is not None and ImageTk is not None:
-            photo = ImageTk.PhotoImage(pil)
-            label = tk.Label(parent, image=photo, bg=bg, cursor="fleur")
-            label.image = photo  # keep a reference
-            label.pack(anchor="w", pady=(6, 0))
-        if not text and pil is None:
-            tk.Label(
-                parent,
-                text="(empty signature)",
-                bg=bg,
-                fg=COLORS["muted"],
-                font=("Segoe UI", 10, "italic"),
-                cursor="fleur",
-            ).pack(anchor="w")
+        self.signature_editor.render_into(parent)
 
     def _apply_signature(
         self, body_plain: str, body_html: str, *, for_preview: bool = False
     ) -> tuple[str, str, str]:
         """Insert the signature (at the marker or bottom). Returns (plain, html, image_path)."""
-        signature = self.signature_box.get("1.0", "end-1c").strip()
+        signature = self.signature_editor.get_html()
         image_path, image_size = self._signature_image_info()
         image_name = Path(image_path).name if image_path else "signature"
         kwargs = {
@@ -1272,26 +1363,28 @@ class MailSenderApp(ctk.CTk):
                 kwargs["signature_image_src"] = image_path
             else:
                 kwargs["signature_image_cid"] = SIGNATURE_IMAGE_CID
-        if signature and "<" in signature:
-            kwargs["signature_html"] = signature
-        else:
-            kwargs["signature_plain"] = signature
+        kwargs["signature_html"] = signature
         if self.signature_mode.get() != "body":
             body_plain = strip_signature_marker(body_plain)
             body_html = strip_signature_marker(body_html)
         plain, html_out = append_signature(body_plain, body_html, **kwargs)
         return plain, html_out, image_path
 
+    @staticmethod
+    def _email_wrapper(html_body: str) -> str:
+        return f'<div style="line-height:1.5;">{html_body}</div>' if html_body else html_body
+
     def _build_preview_html(self, body_html: str) -> str:
         if not self._signature_on():
-            return strip_signature_marker(body_html)
+            return self._email_wrapper(strip_signature_marker(body_html))
         _plain, html_out, _img = self._apply_signature("", body_html, for_preview=True)
-        return html_out
+        return self._email_wrapper(html_out)
 
-    def _browse_signature_file(self) -> None:
+    def _browse_signature_file(self, images_only: bool = False) -> None:
+        image_types = [("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp")]
         path = filedialog.askopenfilename(
-            title="Select signature file",
-            filetypes=[
+            title="Select logo image" if images_only else "Select logo or signature file",
+            filetypes=image_types if images_only else [
                 ("Signature files", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.txt *.html *.htm"),
                 ("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
                 ("Text / HTML", "*.txt *.html *.htm"),
@@ -1305,16 +1398,12 @@ class MailSenderApp(ctk.CTk):
         suffix = file_path.suffix.lower()
 
         if suffix in IMAGE_EXTENSIONS:
-            self.signature_image_path = str(file_path.resolve())
+            self.signature_image_path = trimmed_logo(str(file_path.resolve()))
             self._refresh_signature_image_label()
+            self._sync_logo(place_if_missing=not images_only)
             if not self._signature_on():
                 self._set_signature_mode("bottom")
             self.body_editor.refresh_signature_block()
-            messagebox.showinfo(
-                "Signature Image",
-                f"Image signature loaded:\n{file_path.name}\n\n"
-                "It will be embedded inline when you send.",
-            )
             return
 
         if suffix in SIGNATURE_TEXT_EXTENSIONS:
@@ -1326,8 +1415,7 @@ class MailSenderApp(ctk.CTk):
                 messagebox.showerror("Signature File", str(exc))
                 return
 
-            self.signature_box.delete("1.0", "end")
-            self.signature_box.insert("1.0", content)
+            self.signature_editor.set_content(content)
             if not self._signature_on():
                 self._set_signature_mode("bottom")
             self.body_editor.refresh_signature_block()
@@ -1347,10 +1435,10 @@ class MailSenderApp(ctk.CTk):
             return
         self.signature_image_path = ""
         self._refresh_signature_image_label()
+        self._sync_logo()
         self.body_editor.refresh_signature_block()
 
     def _refresh_signature_image_label(self) -> None:
-        self._refresh_signature_thumb()
         if self.signature_image_path and Path(self.signature_image_path).exists():
             name = Path(self.signature_image_path).name
             size = Path(self.signature_image_path).stat().st_size
@@ -1490,8 +1578,9 @@ class MailSenderApp(ctk.CTk):
         message = self.session.get_section("message")
         if message.get("subject"):
             self.subject_entry.insert(0, message["subject"])
-        if message.get("body_html"):
-            self.body_editor.set_html(message["body_html"])
+        saved_body = message.get("body_html") or ""
+        if saved_body:
+            self.body_editor.set_html(saved_body)
         self.cc_input.set_emails(list(message.get("cc", [])))
         self.bcc_input.set_emails(list(message.get("bcc", [])))
         self.attachment_paths = [
@@ -1501,15 +1590,38 @@ class MailSenderApp(ctk.CTk):
         mode = message.get("signature_mode") or (
             "bottom" if message.get("signature_enabled") else "off"
         )
-        signature_html = message.get("signature_html", "")
-        if signature_html is not None:
-            self.signature_box.delete("1.0", "end")
-            self.signature_box.insert("1.0", signature_html)
-        image_path = message.get("signature_image", "") or ""
-        self.signature_image_path = image_path if image_path and Path(image_path).exists() else ""
+        image_path = message.get("signature_image", DEFAULT_LOGO_KEY) or ""
+        if image_path == DEFAULT_LOGO_KEY or (image_path and not Path(image_path).exists()):
+            # Bundled logo, or a saved logo that no longer exists on this PC.
+            image_path = default_logo_path()
+        self.signature_image_path = trimmed_logo(image_path) if image_path else ""
         self._refresh_signature_image_label()
+        self._sync_logo()
+        signature_html = message.get("signature_html", "")
+        has_text = bool(html_to_plain(signature_html.replace("{{LOGO}}", "")).strip())
+        outdated = int(message.get("template_version") or 0) < TEMPLATE_VERSION
+        migrate = outdated or _CLOSING_KEY_TEXT in html_to_plain(signature_html)
+        if outdated and message.get("signature_image") not in (None, "", DEFAULT_LOGO_KEY):
+            # Saved from an older build: switch to the company logo as well.
+            self.signature_image_path = default_logo_path()
+            self._refresh_signature_image_label()
+            self._sync_logo()
+        if not has_text or migrate:
+            # Logo-only signature (the closing text belongs in the body).
+            signature_html = DEFAULT_SIGNATURE_HTML
+            if message.get("signature_image") in (None, "", DEFAULT_LOGO_KEY):
+                self.signature_image_path = default_logo_path()
+                self._refresh_signature_image_label()
+                self._sync_logo()
+        if signature_html:
+            self.signature_editor.set_content(signature_html)
+            if self.signature_image_path and "{{LOGO}}" not in signature_html:
+                self._sync_logo(place_if_missing=True)
         self.signature_mode.set(mode)
-        if mode == "body":
+        if migrate:
+            self._add_closing_to_body()
+            mode = "body"
+        elif mode == "body":
             if self.body_editor.has_signature_block():
                 self.body_editor.refresh_signature_block()
             else:
@@ -1810,6 +1922,7 @@ class MailSenderApp(ctk.CTk):
         else:
             body_plain = strip_signature_marker(body_plain)
             body_html = strip_signature_marker(body_html)
+        body_html = self._email_wrapper(body_html)
 
         self._stop_requested = False
         self._sending = True

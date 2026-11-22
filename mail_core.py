@@ -22,6 +22,8 @@ EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 SIGNATURE_IMAGE_CID = "mailflow-signature"
 # Placeholder put in the body where the user dropped the signature block.
 SIGNATURE_MARKER = "{{SIGNATURE}}"
+# Placeholder inside the signature where the logo image goes.
+LOGO_MARKER = "{{LOGO}}"
 
 DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 587
@@ -175,17 +177,27 @@ def append_signature(
             f'style="max-width:320px;height:auto;" />'
             f"</div>"
         )
-        if sig_plain:
+        if LOGO_MARKER in sig_html:
+            # Logo positioned by the user inside the signature.
+            inline_img = (
+                f'<img src="{html_lib.escape(src, quote=True)}" alt="Logo"{size_attrs} '
+                f'style="display:block;max-width:320px;height:auto;margin:4px 0;" />'
+            )
+            sig_html = sig_html.replace(LOGO_MARKER, inline_img, 1)
+            sig_plain = sig_plain.replace(LOGO_MARKER, image_note, 1)
+        elif sig_plain:
             if image_note not in sig_plain:
                 sig_plain = f"{sig_plain}\n{image_note}"
         else:
             sig_plain = image_note
-        # Keep any text HTML, then always append the image tag.
-        if sig_html:
-            if html_lib.escape(src, quote=True) not in sig_html and src not in sig_html:
+        if LOGO_MARKER not in (signature_html or ""):
+            # No position chosen: append the image after the text.
+            if sig_html and image_note in sig_plain and "<img" not in sig_html:
                 sig_html = f"{sig_html}{image_html}"
-        else:
-            sig_html = image_html
+            elif not sig_html:
+                sig_html = image_html
+    sig_html = sig_html.replace(LOGO_MARKER, "")
+    sig_plain = sig_plain.replace(LOGO_MARKER, "").strip()
 
     html_base = (body_html or "").strip()
     if not html_base and (body_plain or "").strip():
@@ -193,6 +205,9 @@ def append_signature(
 
     # Signature placed somewhere inside the body.
     if SIGNATURE_MARKER in html_base or SIGNATURE_MARKER in (body_plain or ""):
+        # The signature is a block, so a line break right after it would
+        # only add an empty line.
+        html_base = re.sub(re.escape(SIGNATURE_MARKER) + r"\s*<br\s*/?>", SIGNATURE_MARKER, html_base, count=1)
         html_out = html_base.replace(SIGNATURE_MARKER, sig_html, 1).replace(SIGNATURE_MARKER, "")
         plain = (body_plain or "")
         if SIGNATURE_MARKER in plain:
