@@ -38,6 +38,13 @@ def _empty_session() -> dict[str, Any]:
         "message": {
             "subject": "",
             "body_html": "",
+            "cc": [],
+            "bcc": [],
+            "attachments": [],
+            "signature_enabled": False,
+            "signature_mode": "off",
+            "signature_html": "",
+            "signature_image": "",
         },
         "campaign": {
             "sent": [],

@@ -6,6 +6,7 @@ import html
 import re
 import tkinter as tk
 from tkinter import colorchooser, simpledialog
+from typing import Callable
 
 import customtkinter as ctk
 
@@ -18,6 +19,7 @@ except ImportError:  # pragma: no cover
 PLACEHOLDER_VISUAL = "Write your email content here..."
 PLACEHOLDER_SOURCE = "<p>Start writing your HTML email...</p>"
 PLACEHOLDER_SOURCE_PLAIN = "Start writing your HTML email..."
+SIGNATURE_MARKER = "{{SIGNATURE}}"
 
 
 def html_to_plain(html_body: str) -> str:
@@ -36,7 +38,7 @@ def wrap_email_html(body: str) -> str:
         return ""
     if stripped.startswith("<"):
         return stripped
-    return f"<p>{stripped}</p>"
+    return f"<div>{stripped}</div>"
 
 
 def _link_tag_name(url: str) -> str:
@@ -97,28 +99,20 @@ def _close_tag(tag_name: str) -> str:
 
 
 def text_widget_to_html(widget: tk.Text) -> str:
-    dump = widget.dump("1.0", "end-1c", text=True, tag=True)
+    dump = widget.dump("1.0", "end-1c", text=True, tag=True, window=True)
     if not dump:
         return ""
 
     parts: list[str] = []
-    index = 0
-    while index < len(dump):
-        kind = dump[index]
+    for kind, value, _position in dump:
         if kind == "text":
-            chunk = dump[index + 1]
-            parts.append(html.escape(chunk).replace("\n", "<br>"))
-            index += 2
-            continue
-        if kind == "tagon":
-            parts.append(_open_tag(dump[index + 1], widget))
-            index += 2
-            continue
-        if kind == "tagoff":
-            parts.append(_close_tag(dump[index + 1]))
-            index += 2
-            continue
-        index += 2
+            parts.append(html.escape(value).replace("\n", "<br>"))
+        elif kind == "tagon":
+            parts.append(_open_tag(value, widget))
+        elif kind == "tagoff":
+            parts.append(_close_tag(value))
+        elif kind == "window":
+            parts.append(SIGNATURE_MARKER)
 
     body = "".join(parts).replace("<motion>", "")
     return wrap_email_html(body)
@@ -132,6 +126,12 @@ class HtmlEditor(ctk.CTkFrame):
         self.colors = colors
         self._height = height
         self._active_tab = "Visual Editor"
+        # Signature block support (set by the host app).
+        self.signature_renderer: Callable[[tk.Widget], None] | None = None
+        self.preview_builder: Callable[[str], str] | None = None
+        self._signature_block: tk.Frame | None = None
+        self._drag_active = False
+        self._drag_start = (0, 0)
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -231,6 +231,7 @@ class HtmlEditor(ctk.CTkFrame):
         self.visual_editor.tag_configure("h1", font=("Segoe UI", 22, "bold"), spacing3=8)
         self.visual_editor.tag_configure("h2", font=("Segoe UI", 18, "bold"), spacing3=6)
         self.visual_editor.tag_configure("h3", font=("Segoe UI", 15, "bold"), spacing3=4)
+        self.visual_editor.tag_configure("sig_drop", background=self.colors["accent"])
 
     def _build_source_tab(self, parent) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -357,6 +358,10 @@ class HtmlEditor(ctk.CTkFrame):
 
     def _refresh_preview(self) -> None:
         content = self.get_html()
+        if self.preview_builder is not None:
+            content = self.preview_builder(content)
+        else:
+            content = content.replace(SIGNATURE_MARKER, "")
         if HTMLLabel is not None and isinstance(self.preview_label, HTMLLabel):
             self.preview_label.set_html(self._preview_document(content))
 
@@ -446,6 +451,14 @@ class HtmlEditor(ctk.CTkFrame):
             self.visual_editor.tag_remove(tag, line_start, line_end)
         self.visual_editor.tag_add(f"align_{direction}", line_start, line_end)
 
+    def _plain_as_html(self, plain: str) -> str:
+        plain = (plain or "").strip()
+        if not plain:
+            return ""
+        return wrap_email_html(
+            html.escape(plain).replace("\n", "<br>")
+        )
+
     def get_html(self) -> str:
         self._clear_visual_placeholder()
         self._clear_source_placeholder()
@@ -455,20 +468,26 @@ class HtmlEditor(ctk.CTkFrame):
         tab = self.tabs.get()
 
         if tab == "HTML Source" and not source_empty:
-            return self._source_raw()
+            return wrap_email_html(self._source_raw())
         if not visual_empty:
-            html = text_widget_to_html(self.visual_editor)
-            if html:
-                return html
+            html_body = text_widget_to_html(self.visual_editor)
+            if html_body and html_body.strip():
+                return html_body
+            # Fallback if tag dump fails but text is present.
+            return self._plain_as_html(self._visual_plain())
         if not source_empty:
-            return self._source_raw()
+            return wrap_email_html(self._source_raw())
         return ""
 
     def get_plain_text(self) -> str:
+        if self.has_signature_block() and self.tabs.get() != "HTML Source":
+            return html_to_plain(text_widget_to_html(self.visual_editor))
+        if not self._is_visual_empty():
+            visual = self._visual_plain()
+            if visual and visual != PLACEHOLDER_VISUAL:
+                return visual
         html_body = self.get_html()
         if not html_body:
-            if not self._is_visual_empty():
-                return self._visual_plain()
             return ""
         return html_to_plain(html_body)
 
@@ -483,11 +502,19 @@ class HtmlEditor(ctk.CTkFrame):
         self.source_box.insert("1.0", html_content or PLACEHOLDER_SOURCE)
         self._source_has_placeholder = not html_content
 
+        self._signature_block = None
         self.visual_editor.delete("1.0", "end")
         plain = html_to_plain(html_content)
-        if plain:
+        marker_at = None
+        if SIGNATURE_MARKER in plain:
+            before, _sep, after = plain.partition(SIGNATURE_MARKER)
+            plain = before + after.replace(SIGNATURE_MARKER, "")
+            marker_at = len(before)
+        if plain or marker_at is not None:
             self.visual_editor.insert("1.0", plain)
             self._visual_has_placeholder = False
+            if marker_at is not None and self.signature_renderer is not None:
+                self.insert_signature_block(f"1.0+{marker_at}c", own_line=False)
         else:
             self.visual_editor.insert("1.0", PLACEHOLDER_VISUAL)
             self._visual_has_placeholder = True
@@ -497,3 +524,150 @@ class HtmlEditor(ctk.CTkFrame):
 
     def get_scroll_widgets(self) -> list:
         return [self.source_box, self.visual_editor]
+
+    # ------------------------------------------------------------------
+    # Draggable signature block
+    # ------------------------------------------------------------------
+    def has_signature_block(self) -> bool:
+        block = self._signature_block
+        if block is None:
+            return False
+        try:
+            if not block.winfo_exists():
+                raise tk.TclError
+            self.visual_editor.index(block)
+        except tk.TclError:
+            # User deleted it with Backspace/Delete.
+            self._signature_block = None
+            return False
+        return True
+
+    def insert_signature_block(self, index: str | None = None, own_line: bool = True) -> None:
+        """Embed the signature block at ``index`` (default: cursor, else end)."""
+        if self.signature_renderer is None:
+            return
+        self._clear_visual_placeholder()
+        self.remove_signature_block()
+        text = self.visual_editor
+        if index is None:
+            index = text.index("insert") if text.get("1.0", "end-1c") else "1.0"
+        index = text.index(index)
+        if own_line:
+            index = text.index(f"{index} linestart")
+            line_has_text = bool(text.get(index, f"{index} lineend"))
+            if line_has_text:
+                text.insert(index, "\n")
+        block = self._build_signature_block()
+        text.window_create(index, window=block, align="top", padx=2, pady=4)
+        self._signature_block = block
+        self._active_tab = "Visual Editor"
+
+    def remove_signature_block(self) -> None:
+        if not self.has_signature_block():
+            self._signature_block = None
+            return
+        text = self.visual_editor
+        index = text.index(self._signature_block)
+        text.delete(index)  # destroys the embedded frame
+        self._signature_block = None
+        # Drop the empty line the block occupied (if it isn't the last one).
+        if not text.get(f"{index} linestart", f"{index} lineend") and text.compare(
+            f"{index} lineend", "<", "end-1c"
+        ):
+            text.delete(f"{index} lineend")
+
+    def refresh_signature_block(self) -> None:
+        """Re-render the block in place after the signature text/image changed."""
+        if not self.has_signature_block():
+            return
+        text = self.visual_editor
+        index = text.index(self._signature_block)
+        text.delete(index)
+        block = self._build_signature_block()
+        text.window_create(index, window=block, align="top", padx=2, pady=4)
+        self._signature_block = block
+
+    def _build_signature_block(self) -> tk.Frame:
+        colors = self.colors
+        block = tk.Frame(
+            self.visual_editor,
+            bg=colors["surface"],
+            highlightthickness=2,
+            highlightbackground=colors["accent"],
+            highlightcolor=colors["accent"],
+            cursor="fleur",
+        )
+        handle = tk.Label(
+            block,
+            text="\u2725  Signature \u2014 drag to move",
+            bg=colors["accent"],
+            fg="#FFFFFF",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+            padx=8,
+            pady=2,
+            cursor="fleur",
+        )
+        handle.pack(fill="x")
+        content = tk.Frame(block, bg=colors["surface"], cursor="fleur")
+        content.pack(fill="both", expand=True, padx=10, pady=8)
+        if self.signature_renderer is not None:
+            self.signature_renderer(content)
+        self._bind_drag(block)
+        return block
+
+    def _bind_drag(self, widget: tk.Widget) -> None:
+        widget.bind("<ButtonPress-1>", self._on_sig_press, add="+")
+        widget.bind("<B1-Motion>", self._on_sig_motion, add="+")
+        widget.bind("<ButtonRelease-1>", self._on_sig_release, add="+")
+        for child in widget.winfo_children():
+            self._bind_drag(child)
+
+    def _drop_index(self, event) -> str:
+        text = self.visual_editor
+        x = event.x_root - text.winfo_rootx()
+        y = event.y_root - text.winfo_rooty()
+        height = text.winfo_height()
+        if y < 10:
+            text.yview_scroll(-1, "units")
+        elif y > height - 10:
+            text.yview_scroll(1, "units")
+        x = max(0, min(x, text.winfo_width() - 1))
+        y = max(0, min(y, height - 1))
+        return text.index(f"@{x},{y} linestart")
+
+    def _on_sig_press(self, event) -> str:
+        self._drag_start = (event.x_root, event.y_root)
+        self._drag_active = False
+        return "break"
+
+    def _on_sig_motion(self, event) -> str:
+        dx = abs(event.x_root - self._drag_start[0])
+        dy = abs(event.y_root - self._drag_start[1])
+        if not self._drag_active and max(dx, dy) < 6:
+            return "break"
+        self._drag_active = True
+        text = self.visual_editor
+        target = self._drop_index(event)
+        text.tag_remove("sig_drop", "1.0", "end")
+        text.tag_add("sig_drop", target, f"{target} lineend+1c")
+        return "break"
+
+    def _on_sig_release(self, event) -> str:
+        text = self.visual_editor
+        text.tag_remove("sig_drop", "1.0", "end")
+        if not self._drag_active or not self.has_signature_block():
+            return "break"
+        self._drag_active = False
+        target = self._drop_index(event)
+        current = text.index(self._signature_block)
+        if text.index(f"{current} linestart") == target:
+            return "break"
+        # A mark follows the text while the old block is removed.
+        text.mark_set("sig_target", target)
+        text.mark_gravity("sig_target", "left")
+        self.remove_signature_block()
+        self.insert_signature_block(text.index("sig_target"))
+        text.mark_unset("sig_target")
+        return "break"
+

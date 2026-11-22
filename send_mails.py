@@ -9,10 +9,13 @@ from pathlib import Path
 from mail_core import (
     DEFAULT_SMTP_HOST,
     DEFAULT_SMTP_PORT,
+    append_signature,
     collect_recipients,
+    is_valid_email,
     list_columns,
     load_workbook,
     send_bulk_emails,
+    split_emails,
 )
 
 
@@ -80,6 +83,32 @@ def main() -> int:
         print("Email body is required.")
         return 1
 
+    cc_raw = prompt("CC addresses (comma-separated, optional): ", required=False)
+    bcc_raw = prompt("BCC addresses (comma-separated, optional): ", required=False)
+    cc = [email for email in split_emails(cc_raw) if is_valid_email(email)]
+    bcc = [email for email in split_emails(bcc_raw) if is_valid_email(email)]
+
+    attachments: list[str] = []
+    attach_raw = prompt("Attachment file paths (comma-separated, optional): ", required=False)
+    if attach_raw:
+        for part in attach_raw.split(","):
+            path = Path(part.strip())
+            if path.exists() and path.is_file():
+                attachments.append(str(path))
+            elif part.strip():
+                print(f"Skipping missing attachment: {part.strip()}")
+
+    signature = ""
+    if prompt_yes_no("Add a signature?", default=False):
+        print("Enter signature. Finish with an empty line:")
+        sig_lines = []
+        while True:
+            line = input()
+            if not line:
+                break
+            sig_lines.append(line)
+        signature = "\n".join(sig_lines).strip()
+
     smtp_host = prompt(f"SMTP host [{DEFAULT_SMTP_HOST}]: ", required=False) or DEFAULT_SMTP_HOST
     smtp_port_text = prompt(f"SMTP port [{DEFAULT_SMTP_PORT}]: ", required=False) or str(DEFAULT_SMTP_PORT)
     try:
@@ -93,7 +122,7 @@ def main() -> int:
         sheet = workbook.active
         columns = list_columns(sheet)
         column_index = choose_column(columns)
-        recipients = collect_recipients(
+        recipients, _stats = collect_recipients(
             sheet,
             column_index,
             on_invalid=lambda email: print(f"Skipping invalid email: {email}"),
@@ -126,6 +155,11 @@ def main() -> int:
             print(f"[{current}/{total}] Sending to {recipient}... FAILED")
             print("\nAuthentication failed. Check your email and app password.")
 
+    body_plain = body
+    body_html = None
+    if signature:
+        body_plain, body_html = append_signature(body_plain, None, signature_plain=signature)
+
     sent, failed = send_bulk_emails(
         smtp_host=smtp_host,
         smtp_port=smtp_port,
@@ -133,7 +167,11 @@ def main() -> int:
         app_password=app_password,
         recipients=recipients,
         subject=subject,
-        body_plain=body,
+        body_plain=body_plain,
+        body_html=body_html,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
         on_progress=on_progress,
     )
 
